@@ -21,7 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::fs;
-use tokio_stream::StreamExt;
+use tokio_stream::{Stream, StreamExt};
 
 /// Invoke ffmpeg to encode a video or image.
 #[derive(Parser)]
@@ -46,11 +46,36 @@ pub async fn encode(args: Args) -> anyhow::Result<()> {
     );
     bar.enable_steady_tick(Duration::from_millis(100));
 
-    let probe = ffprobe::probe(&args.args.input);
-    run(args, probe.into(), &bar).await
+    let probe = Arc::new(ffprobe::probe(&args.args.input));
+    if args.encode.output.is_none() {
+        let output = default_output_name(&args.args.input, &args.args.encoder, probe.is_image);
+        let out = shell_escape::escape(output.display().to_string().into());
+        bar.println(style!("Encoding {out}").dim().to_string());
+    }
+    consume(args, probe, &bar).await
 }
 
-pub async fn run(
+#[derive(Debug, Clone, PartialEq)]
+pub enum Update {
+    Progress {
+        frame: u64,
+        fps: f32,
+        time: Duration,
+    },
+    StreamSizes {
+        video: u64,
+        audio: u64,
+        subtitle: u64,
+        other: u64,
+    },
+    Done {
+        output: PathBuf,
+        input_size: u64,
+        output_size: u64,
+    },
+}
+
+pub fn run(
     Args {
         args,
         crf,
@@ -64,39 +89,33 @@ pub async fn run(
             },
     }: Args,
     probe: Arc<Ffprobe>,
-    bar: &ProgressBar,
-) -> anyhow::Result<()> {
-    let defaulting_output = output.is_none();
-    let output =
-        output.unwrap_or_else(|| default_output_name(&args.input, &args.encoder, probe.is_image));
+) -> impl Stream<Item = anyhow::Result<Update>> {
+    async_stream::try_stream! {
+    let output = output.unwrap_or_else(|| {
+        default_output_name(&args.input, &args.encoder, probe.is_image)
+    });
 
-    anyhow::ensure!(
-        overwrite_input || !is_same_file(&output, &args.input).unwrap_or(false),
-        "Input and Output are specified as the same file. Not proceeding. \
-         Pass in `--overwrite-input` to allow this."
-    );
+    if !overwrite_input && is_same_file(&output, &args.input).unwrap_or(false) {
+        Err(anyhow::anyhow!(
+            "Input and Output are specified as the same file. Not proceeding. \
+             Pass in `--overwrite-input` to allow this."
+        ))?;
+    }
 
     // output is temporary until encoding has completed successfully
     temporary::add(&output, TempKind::NotKeepable);
 
-    if defaulting_output {
-        let out = shell_escape::escape(output.display().to_string().into());
-        bar.println(style!("Encoding {out}").dim().to_string());
-    }
-    bar.set_message("encoding, ");
-
     let mut enc_args = args.to_ffmpeg_args(crf, &probe)?;
     enc_args.video_only = video_only;
     let has_audio = probe.has_audio;
-    if let Ok(d) = &probe.duration {
-        bar.set_length(d.as_micros_u64().max(1));
-    }
 
     // only downmix if achannels > 3
     let stereo_downmix = downmix_to_stereo && probe.max_audio_channels.is_some_and(|c| c > 3);
     let audio_codec = audio_codec.as_deref();
     if stereo_downmix && audio_codec == Some("copy") {
-        anyhow::bail!("--stereo-downmix cannot be used with --acodec copy");
+        Err(anyhow::anyhow!(
+            "--stereo-downmix cannot be used with --acodec copy"
+        ))?;
     }
 
     info!(
@@ -105,36 +124,74 @@ pub async fn run(
     );
 
     let mut enc = ffmpeg::encode(enc_args, &output, has_audio, audio_codec, stereo_downmix)?;
-    let mut logger = ProgressLogger::new(module_path!(), Instant::now());
-    let mut stream_sizes = None;
     while let Some(progress) = enc.next().await {
         match progress? {
-            FfmpegOut::Progress { fps, time, .. } => {
-                if fps > 0.0 {
-                    bar.set_message(format!("{fps} fps, "));
-                }
-                if let Ok(d) = &probe.duration {
-                    bar.set_position(time.as_micros_u64());
-                    logger.update(*d, time, fps);
-                }
+            FfmpegOut::Progress { frame, fps, time } => {
+                yield Update::Progress { frame, fps, time };
             }
             FfmpegOut::StreamSizes {
                 video,
                 audio,
                 subtitle,
                 other,
-            } => stream_sizes = Some((video, audio, subtitle, other)),
+            } => yield Update::StreamSizes { video, audio, subtitle, other },
         }
     }
     enc.wait().await?; // ensure process has exited
-    bar.finish();
 
     // successful encode, so don't delete it!
     temporary::unadd(&output);
 
-    // print output info
     let output_size = fs::metadata(&output).await?.len();
-    let output_percent = 100.0 * output_size as f64 / fs::metadata(&args.input).await?.len() as f64;
+    let input_size = fs::metadata(&args.input).await?.len();
+    yield Update::Done { output, input_size, output_size };
+    }
+}
+
+pub(crate) async fn consume(
+    args: Args,
+    probe: Arc<Ffprobe>,
+    bar: &ProgressBar,
+) -> anyhow::Result<()> {
+    bar.set_message("encoding, ");
+    if let Ok(d) = &probe.duration {
+        bar.set_length(d.as_micros_u64().max(1));
+    }
+
+    let duration = probe.duration.as_ref().ok().copied();
+    let mut logger = ProgressLogger::new(module_path!(), Instant::now());
+    let mut stream_sizes = None;
+    let mut updates = std::pin::pin!(run(args, probe));
+    while let Some(update) = updates.next().await {
+        match update? {
+            Update::Progress { fps, time, .. } => {
+                if fps > 0.0 {
+                    bar.set_message(format!("{fps} fps, "));
+                }
+                if let Some(d) = duration {
+                    bar.set_position(time.as_micros_u64());
+                    logger.update(d, time, fps);
+                }
+            }
+            Update::StreamSizes {
+                video,
+                audio,
+                subtitle,
+                other,
+            } => stream_sizes = Some((video, audio, subtitle, other)),
+            Update::Done {
+                input_size,
+                output_size,
+                ..
+            } => print_done(input_size, output_size, stream_sizes),
+        }
+    }
+    bar.finish();
+    Ok(())
+}
+
+fn print_done(input_size: u64, output_size: u64, stream_sizes: Option<(u64, u64, u64, u64)>) {
+    let output_percent = 100.0 * output_size as f64 / input_size as f64;
     let output_size = style(HumanBytes(output_size)).dim().bold();
     let output_percent = style!("{}%", output_percent.round()).dim().bold();
     eprint!(
@@ -158,8 +215,6 @@ pub async fn run(
         }
     }
     eprintln!("{}", style(")").dim());
-
-    Ok(())
 }
 
 /// * vid.mp4 -> "mp4"

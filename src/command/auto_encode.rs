@@ -179,7 +179,7 @@ pub async fn auto_encode(Args { mut search, encode }: Args) -> anyhow::Result<()
     bar.set_prefix("Encoding");
     bar.enable_steady_tick(Duration::from_millis(100));
 
-    encode::run(
+    encode::consume(
         encode::Args {
             args: enc_args,
             crf: best.crf,
