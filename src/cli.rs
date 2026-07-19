@@ -1,4 +1,4 @@
-use crate::{command, process, temporary};
+use crate::{cancel_job, command, finish_job};
 use ::log::LevelFilter;
 use anyhow::anyhow;
 use clap::Parser;
@@ -50,8 +50,13 @@ pub async fn run() {
     };
     drop(local);
 
-    process::child::wait().await;
-    temporary::clean(keep).await;
+    let out = match out {
+        Ok(()) => finish_job(keep).await,
+        Err(command_error) => match cancel_job().await {
+            Ok(()) => Err(command_error),
+            Err(cleanup_error) => Err(anyhow!("{command_error}\n{cleanup_error}")),
+        },
+    };
 
     if let Err(err) = out {
         eprintln!("Error: {err}");

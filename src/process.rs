@@ -109,7 +109,7 @@ impl FfmpegOut {
 
     pub fn stream(child: Child, name: &'static str, cmd_str: String) -> FfmpegOutStream {
         FfmpegOutStream {
-            chunk_stream: ProcessChunkStream::from(child),
+            chunk_stream: ProcessChunkStream::from(child).into(),
             chunks: <_>::default(),
             name,
             cmd_str,
@@ -229,7 +229,7 @@ pin_project_lite::pin_project! {
     #[must_use = "streams do nothing unless polled"]
     pub struct FfmpegOutStream {
         #[pin]
-        chunk_stream: ProcessChunkStream,
+        chunk_stream: child::AddOnDropChunkStream,
         name: &'static str,
         cmd_str: String,
         chunks: Chunks,

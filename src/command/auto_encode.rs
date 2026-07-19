@@ -169,7 +169,7 @@ pub async fn auto_encode(Args { mut search, encode }: Args) -> anyhow::Result<()
         style(best.enc.single_score()).green(),
         style(format!("{:.0}%", best.enc.encode_percent)).green(),
     ));
-    temporary::clean_all().await;
+    temporary::clean_all().await?;
 
     let bar = ProgressBar::new(12).with_style(
         ProgressStyle::default_bar()

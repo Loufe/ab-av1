@@ -421,7 +421,7 @@ pub fn run(
                     }
 
                     // Early clean. Note: Avoid cleaning copy samples
-                    temporary::clean(true).await;
+                    temporary::clean(true).await?;
                     if !keep {
                         let _ = tokio::fs::remove_file(encoded_sample).await;
                     }
