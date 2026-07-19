@@ -42,7 +42,10 @@ impl Ffprobe {
 pub fn probe(input: &Path) -> Ffprobe {
     let is_image = is_image(input).unwrap_or(false);
 
-    let probe = match ffprobe::ffprobe(input) {
+    let config = ffprobe::Config::builder()
+        .ffprobe_bin(crate::tools::ffprobe())
+        .build();
+    let probe = match ffprobe::ffprobe_config(config, input) {
         Ok(p) => p,
         Err(err) => {
             return Ffprobe {

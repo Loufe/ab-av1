@@ -13,9 +13,15 @@ use std::{
     time::Duration,
 };
 use time::macros::format_description;
-use tokio::process::Child;
-use tokio_process_stream::{Item, ProcessChunkStream};
+use tokio::process::Command;
 use tokio_stream::Stream;
+
+#[derive(Debug)]
+pub enum Item {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+    Done(io::Result<ExitStatus>),
+}
 
 pub fn ensure_success(name: &'static str, out: &Output) -> anyhow::Result<()> {
     ensure!(
@@ -107,13 +113,17 @@ impl FfmpegOut {
         None
     }
 
-    pub fn stream(child: Child, name: &'static str, cmd_str: String) -> FfmpegOutStream {
-        FfmpegOutStream {
-            chunk_stream: ProcessChunkStream::from(child).into(),
+    pub fn stream(
+        command: Command,
+        name: &'static str,
+        cmd_str: String,
+    ) -> io::Result<FfmpegOutStream> {
+        Ok(FfmpegOutStream {
+            chunk_stream: child::spawn(command)?,
             chunks: <_>::default(),
             name,
             cmd_str,
-        }
+        })
     }
 }
 
@@ -229,7 +239,7 @@ pin_project_lite::pin_project! {
     #[must_use = "streams do nothing unless polled"]
     pub struct FfmpegOutStream {
         #[pin]
-        chunk_stream: child::AddOnDropChunkStream,
+        chunk_stream: child::ManagedChunkStream,
         name: &'static str,
         cmd_str: String,
         chunks: Chunks,
@@ -238,10 +248,7 @@ pin_project_lite::pin_project! {
 
 impl FfmpegOutStream {
     pub async fn wait(&mut self) -> io::Result<ExitStatus> {
-        match self.chunk_stream.child_mut() {
-            Some(c) => c.wait().await,
-            None => Ok(<_>::default()),
-        }
+        self.chunk_stream.child().lock().await.wait().await
     }
 }
 

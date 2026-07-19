@@ -1,78 +1,184 @@
+use command_group::{AsyncCommandGroup, AsyncGroupChild};
 use log::info;
 use std::{
-    io::IsTerminal,
+    io::{self, IsTerminal},
     mem,
-    ops::{Deref, DerefMut},
     pin::Pin,
-    sync::{LazyLock, Mutex},
-    task::{Context, Poll},
+    process::{Output, Stdio},
+    sync::{Arc, LazyLock, Mutex},
     time::Duration,
 };
-use tokio::time::{Instant, timeout_at};
-use tokio_process_stream::ProcessChunkStream;
+use tokio::{
+    io::{AsyncReadExt, BufReader},
+    process::{ChildStderr, ChildStdout, Command},
+    sync::Mutex as AsyncMutex,
+    time::{Instant, timeout_at},
+};
+use tokio_stream::{Stream, StreamExt};
 
-static RUNNING: LazyLock<Mutex<Vec<ProcessChunkStream>>> = LazyLock::new(<_>::default);
+use super::Item;
 
-/// Add a child process so it may be waited on before exiting.
-pub fn add(mut child: ProcessChunkStream) {
-    let mut running = RUNNING.lock().unwrap();
+type ChildHandle = Arc<AsyncMutex<AsyncGroupChild>>;
 
-    // remove any that have exited already
-    running.retain_mut(|c| !c.exited());
+static RUNNING: LazyLock<Mutex<Vec<ChildHandle>>> = LazyLock::new(<_>::default);
 
-    if !child.exited() {
-        running.push(child);
+/// Output stream for a process registered for job finalization.
+pub struct ManagedChunkStream {
+    stream: Pin<Box<dyn Stream<Item = Item>>>,
+    child: ChildHandle,
+}
+
+impl ManagedChunkStream {
+    pub fn child(&self) -> &ChildHandle {
+        &self.child
     }
 }
 
-/// Wait for all child processes, that were added with [`add`], to exit.
-pub async fn wait() -> anyhow::Result<()> {
-    // if waiting takes >500ms log what's happening
-    let mut log_deadline = Some(Instant::now() + Duration::from_millis(500));
-    let procs = mem::take(&mut *RUNNING.lock().unwrap());
-    let mut errors = Vec::new();
+impl Stream for ManagedChunkStream {
+    type Item = Item;
 
-    for (index, mut proc) in procs.into_iter().enumerate() {
-        if let Some(child) = proc.child_mut() {
-            let waited = match log_deadline {
-                Some(deadline) => match timeout_at(deadline, child.wait()).await {
-                    Ok(waited) => waited,
-                    Err(_) => {
-                        log_waiting();
-                        log_deadline = None;
-                        child.wait().await
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.stream.as_mut().poll_next(cx)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.stream.size_hint()
+    }
+}
+
+/// Spawn a command in an OS process group and register it immediately.
+pub fn spawn(mut command: Command) -> io::Result<ManagedChunkStream> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut group = command.group();
+    group.kill_on_drop(true);
+    #[cfg(windows)]
+    group.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    let mut child = group.spawn()?;
+    let stdout = child
+        .inner()
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("child stdout was not piped"))?;
+    let stderr = child
+        .inner()
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("child stderr was not piped"))?;
+    let child = Arc::new(AsyncMutex::new(child));
+    RUNNING.lock().unwrap().push(Arc::clone(&child));
+
+    let stream_child = Arc::clone(&child);
+    let stream = Box::pin(chunk_stream(stdout, stderr, stream_child));
+    Ok(ManagedChunkStream { stream, child })
+}
+
+/// Run a registered command to completion and collect its output.
+pub async fn output(command: Command) -> io::Result<Output> {
+    let mut stream = spawn(command)?;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let status = loop {
+        match stream.next().await {
+            Some(Item::Stdout(chunk)) => stdout.extend(chunk),
+            Some(Item::Stderr(chunk)) => stderr.extend(chunk),
+            Some(Item::Done(status)) => break status?,
+            None => return Err(io::Error::other("child ended without an exit status")),
+        }
+    };
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn chunk_stream(
+    stdout: ChildStdout,
+    stderr: ChildStderr,
+    child: ChildHandle,
+) -> impl Stream<Item = Item> {
+    async_stream::stream! {
+        let mut stdout = BufReader::new(stdout);
+        let mut stderr = BufReader::new(stderr);
+        let mut stdout_open = true;
+        let mut stderr_open = true;
+        let mut stdout_buf = vec![0; 4096];
+        let mut stderr_buf = vec![0; 4096];
+
+        while stdout_open || stderr_open {
+            tokio::select! {
+                read = stdout.read(&mut stdout_buf), if stdout_open => match read {
+                    Ok(0) => stdout_open = false,
+                    Ok(len) => yield Item::Stdout(stdout_buf[..len].to_vec()),
+                    Err(error) => {
+                        yield Item::Done(Err(error));
+                        return;
                     }
                 },
-                None => child.wait().await,
-            };
-            if let Err(error) = waited {
-                errors.push(format!("child {index}: {error}"));
+                read = stderr.read(&mut stderr_buf), if stderr_open => match read {
+                    Ok(0) => stderr_open = false,
+                    Ok(len) => yield Item::Stderr(stderr_buf[..len].to_vec()),
+                    Err(error) => {
+                        yield Item::Done(Err(error));
+                        return;
+                    }
+                },
             }
+        }
+
+        yield Item::Done(child.lock().await.wait().await);
+    }
+}
+
+/// Wait for all registered process groups to exit.
+pub async fn wait() -> anyhow::Result<()> {
+    let mut log_deadline = Some(Instant::now() + Duration::from_millis(500));
+    let processes = mem::take(&mut *RUNNING.lock().unwrap());
+    let mut errors = Vec::new();
+
+    for (index, process) in processes.into_iter().enumerate() {
+        let mut process = process.lock().await;
+        let waited = match log_deadline {
+            Some(deadline) => match timeout_at(deadline, process.wait()).await {
+                Ok(waited) => waited,
+                Err(_) => {
+                    log_waiting();
+                    log_deadline = None;
+                    process.wait().await
+                }
+            },
+            None => process.wait().await,
+        };
+        if let Err(error) = waited {
+            errors.push(format!("child {index}: {error}"));
         }
     }
 
     collected_errors("failed to wait for child processes", errors)
 }
 
-/// Terminate every registered child process and wait for it to exit.
+/// Terminate every registered process group and wait for it to exit.
 pub async fn kill_all() -> anyhow::Result<()> {
-    let procs = mem::take(&mut *RUNNING.lock().unwrap());
+    let processes = mem::take(&mut *RUNNING.lock().unwrap());
     let mut errors = Vec::new();
 
-    for (index, mut proc) in procs.into_iter().enumerate() {
-        if let Some(child) = proc.child_mut() {
-            match child.try_wait() {
-                Ok(Some(_)) => continue,
-                Ok(None) => {
-                    if let Err(error) = child.kill().await {
-                        errors.push(format!("child {index} termination: {error}"));
-                        if let Err(error) = child.wait().await {
-                            errors.push(format!("child {index} wait: {error}"));
-                        }
-                    }
+    for (index, process) in processes.into_iter().enumerate() {
+        let mut process = process.lock().await;
+        match process.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                if let Err(error) = process.kill().await {
+                    errors.push(format!("child {index} termination: {error}"));
                 }
-                Err(error) => errors.push(format!("child {index} status: {error}")),
+                if let Err(error) = process.wait().await {
+                    errors.push(format!("child {index} wait: {error}"));
+                }
             }
+            Err(error) => errors.push(format!("child {index} status: {error}")),
         }
     }
 
@@ -91,70 +197,5 @@ fn collected_errors(context: &str, errors: Vec<String>) -> anyhow::Result<()> {
         Ok(())
     } else {
         anyhow::bail!("{context}:\n{}", errors.join("\n"))
-    }
-}
-
-/// Wrapper that [`add`]s the inner on drop.
-#[derive(Debug)]
-pub struct AddOnDropChunkStream(Option<ProcessChunkStream>);
-
-impl From<ProcessChunkStream> for AddOnDropChunkStream {
-    fn from(v: ProcessChunkStream) -> Self {
-        Self(Some(v))
-    }
-}
-
-impl Drop for AddOnDropChunkStream {
-    fn drop(&mut self) {
-        if let Some(child) = self.0.take() {
-            add(child);
-        }
-    }
-}
-
-impl Deref for AddOnDropChunkStream {
-    type Target = ProcessChunkStream;
-
-    fn deref(&self) -> &Self::Target {
-        self.0.as_ref().unwrap() // only none after drop
-    }
-}
-
-impl DerefMut for AddOnDropChunkStream {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.0.as_mut().unwrap() // only none after drop
-    }
-}
-
-impl tokio_stream::Stream for AddOnDropChunkStream {
-    type Item = <ProcessChunkStream as tokio_stream::Stream>::Item;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let inner = self
-            .get_mut()
-            .0
-            .as_mut()
-            .expect("inner process stream is present until drop");
-        Pin::new(inner).poll_next(cx)
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.0
-            .as_ref()
-            .map_or((0, Some(0)), tokio_stream::Stream::size_hint)
-    }
-}
-
-trait Exited {
-    /// Returns true if the child process has exited.
-    fn exited(&mut self) -> bool;
-}
-
-impl Exited for ProcessChunkStream {
-    fn exited(&mut self) -> bool {
-        let Some(child) = self.child_mut() else {
-            return true; // no child process
-        };
-        child.try_wait().is_ok_and(|s| s.is_some())
     }
 }

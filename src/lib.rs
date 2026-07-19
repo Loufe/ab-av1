@@ -9,8 +9,11 @@ mod log;
 mod process;
 mod sample;
 mod temporary;
+mod tools;
 mod vmaf;
 mod xpsnr;
+
+pub use tools::{ToolPaths, with_tool_paths};
 
 /// Finish one library job after its command stream has completed.
 ///

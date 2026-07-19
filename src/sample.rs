@@ -42,7 +42,8 @@ pub async fn copy(
 
     // Note: `-ss` before `-i` & `-frames:v` instead of `-t`
     // See https://github.com/alexheretic/ab-av1/issues/36#issuecomment-1146634936
-    let mut out = Command::new("ffmpeg")
+    let mut command = Command::new(crate::tools::ffmpeg());
+    command
         .arg("-y")
         .arg2("-ss", sample_start_s)
         .arg2("-i", input)
@@ -51,8 +52,8 @@ pub async fn copy(
         .arg("-an")
         .arg("-sn")
         .arg(&dest)
-        .stdin(Stdio::null())
-        .output()
+        .stdin(Stdio::null());
+    let mut out = crate::process::child::output(command)
         .await
         .context("ffmpeg copy")?;
 
@@ -60,7 +61,8 @@ pub async fn copy(
         && String::from_utf8_lossy(&out.stderr)
             .contains("Can't write packet with unknown timestamp")
     {
-        out = Command::new("ffmpeg")
+        let mut command = Command::new(crate::tools::ffmpeg());
+        command
             .arg("-y")
             // try +genpts workaround
             .arg2("-fflags", "+genpts")
@@ -71,8 +73,8 @@ pub async fn copy(
             .arg("-an")
             .arg("-sn")
             .arg(&dest)
-            .stdin(Stdio::null())
-            .output()
+            .stdin(Stdio::null());
+        out = crate::process::child::output(command)
             .await
             .context("ffmpeg copy")?;
     }

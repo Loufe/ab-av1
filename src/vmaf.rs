@@ -1,10 +1,10 @@
 //! vmaf logic
+use crate::process::Item;
 use crate::process::{Chunks, CommandExt, FfmpegOut, cmd_err, exit_ok_stderr};
 use anyhow::Context;
 use log::{debug, info};
 use std::{path::Path, process::Stdio};
 use tokio::process::Command;
-use tokio_process_stream::{Item, ProcessChunkStream};
 use tokio_stream::{Stream, StreamExt};
 
 /// Calculate VMAF score using ffmpeg.
@@ -20,9 +20,8 @@ pub fn run(
         reference.file_name().and_then(|n| n.to_str()).unwrap_or(""),
     );
 
-    let mut cmd = Command::new("ffmpeg");
-    cmd.kill_on_drop(true)
-        .arg2_opt("-r", fps)
+    let mut cmd = Command::new(crate::tools::ffmpeg());
+    cmd.arg2_opt("-r", fps)
         .arg2("-i", distorted)
         .arg2_opt("-r", fps)
         .arg2("-i", reference)
@@ -38,9 +37,7 @@ pub fn run(
 
     let cmd_str = cmd.to_cmd_str();
     debug!("cmd `{cmd_str}`");
-    let mut vmaf = crate::process::child::AddOnDropChunkStream::from(
-        ProcessChunkStream::try_from(cmd).context("ffmpeg vmaf")?,
-    );
+    let mut vmaf = crate::process::child::spawn(cmd).context("ffmpeg vmaf")?;
 
     Ok(async_stream::stream! {
         let mut chunks = Chunks::default();

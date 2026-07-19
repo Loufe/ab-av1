@@ -85,9 +85,8 @@ pub fn encode_sample(
 
     temporary::add(&dest, TempKind::Keepable);
 
-    let mut cmd = Command::new("ffmpeg");
-    cmd.kill_on_drop(true)
-        .arg("-y")
+    let mut cmd = Command::new(crate::tools::ffmpeg());
+    cmd.arg("-y")
         .args(input_args.iter().map(|a| &**a))
         .arg2("-i", input)
         .arg2("-c:v", &*vcodec)
@@ -106,9 +105,8 @@ pub fn encode_sample(
     let cmd_str = cmd.to_cmd_str();
     debug!("cmd `{cmd_str}`");
 
-    let enc = cmd.spawn().context("ffmpeg encode_sample")?;
-
-    let stream = FfmpegOut::stream(enc, "ffmpeg encode_sample", cmd_str);
+    let stream =
+        FfmpegOut::stream(cmd, "ffmpeg encode_sample", cmd_str).context("ffmpeg encode_sample")?;
     Ok((dest, stream))
 }
 
@@ -158,9 +156,8 @@ pub fn encode(
         write!(&mut metadata, " {} {preset}", vcodec.preset_arg()).unwrap();
     }
 
-    let mut cmd = Command::new("ffmpeg");
-    cmd.kill_on_drop(true)
-        .args(input_args.iter().map(|a| &**a))
+    let mut cmd = Command::new(crate::tools::ffmpeg());
+    cmd.args(input_args.iter().map(|a| &**a))
         .arg("-y")
         .arg2("-i", input)
         .arg2("-map", map)
@@ -186,9 +183,7 @@ pub fn encode(
     let cmd_str = cmd.to_cmd_str();
     debug!("cmd `{cmd_str}`");
 
-    let enc = cmd.spawn().context("ffmpeg encode")?;
-
-    Ok(FfmpegOut::stream(enc, "ffmpeg encode", cmd_str))
+    FfmpegOut::stream(cmd, "ffmpeg encode", cmd_str).context("ffmpeg encode")
 }
 
 pub fn pre_extension_name(vcodec: &str) -> &str {
