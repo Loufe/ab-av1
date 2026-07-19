@@ -13,7 +13,7 @@ pub struct Args {
 pub fn print_completions(Args { shell }: Args) {
     clap_complete::generate(
         shell,
-        &mut crate::Command::command(),
+        &mut crate::cli::Command::command(),
         "ab-av1",
         &mut std::io::stdout(),
     );

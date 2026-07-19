@@ -2,6 +2,7 @@ pub mod args;
 pub mod auto_encode;
 pub mod crf_search;
 pub mod encode;
+#[cfg(feature = "cli")]
 pub mod print_completions;
 pub mod sample_encode;
 pub mod vmaf;
@@ -10,6 +11,7 @@ pub mod xpsnr;
 pub use auto_encode::auto_encode;
 pub use crf_search::crf_search;
 pub use encode::encode;
+#[cfg(feature = "cli")]
 pub use print_completions::print_completions;
 pub use sample_encode::sample_encode;
 pub use vmaf::vmaf;
