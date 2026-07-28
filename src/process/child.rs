@@ -1,17 +1,18 @@
-use log::info;
 use std::{
-    io::IsTerminal,
-    mem,
     ops::{Deref, DerefMut},
-    pin::pin,
     sync::{LazyLock, Mutex},
-    time::Duration,
 };
+use tokio_process_stream::ProcessChunkStream;
+
+#[cfg(feature = "cli")]
+use log::info;
+#[cfg(feature = "cli")]
+use std::{io::IsTerminal, mem, pin::pin, time::Duration};
+#[cfg(feature = "cli")]
 use tokio::{
     signal,
     time::{Instant, timeout_at},
 };
-use tokio_process_stream::ProcessChunkStream;
 
 static RUNNING: LazyLock<Mutex<Vec<ProcessChunkStream>>> = LazyLock::new(<_>::default);
 
@@ -28,6 +29,7 @@ pub fn add(mut child: ProcessChunkStream) {
 }
 
 /// Wait for all child processes, that were added with [`add`], to exit.
+#[cfg(feature = "cli")]
 pub async fn wait() {
     // if waiting takes >500ms log what's happening
     let mut log_deadline = Some(Instant::now() + Duration::from_millis(500));
@@ -53,6 +55,7 @@ pub async fn wait() {
     }
 }
 
+#[cfg(feature = "cli")]
 fn log_waiting() {
     match std::io::stderr().is_terminal() {
         true => eprintln!("Waiting for child processes to exit..."),
@@ -60,6 +63,7 @@ fn log_waiting() {
     }
 }
 
+#[cfg(feature = "cli")]
 fn log_abort_wait() {
     match std::io::stderr().is_terminal() {
         true => eprintln!("Aborting wait for child processes"),
